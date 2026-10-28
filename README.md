@@ -1,13 +1,13 @@
 # AI 签到控制台 · Cloudflare Worker
 
-把 **Trae、WorkBuddy、ZCode** 的每日签到 / 活动领取统一搬到云端：不用开电脑、不用装客户端、不用守时间。各扫一次码、粘一次凭据把账号托管进去，之后 Worker 自己续期令牌、按时执行、记录结果。
+把 **Trae、WorkBuddy、ZCode** 的每日签到 / 活动领取统一搬到云端：不用开电脑、不用装客户端、不用守时间。各完成一次授权把账号托管进去，之后 Worker 自己续期令牌、按时执行、记录结果。
 
 **全部代码在 `worker.js` 一个文件里**——没有构建、没有依赖、没有 import，直接粘进 Cloudflare 网页控制台就能跑。
 
 |          | Trae               | WorkBuddy    | ZCode              |
 | -------- | ------------------ | ------------ | ------------------ |
-| 添加账号     | 抖音扫码 + 粘贴回调链接      | 微信扫码         | 粘贴 JWT Token       |
-| 凭据       | refreshToken + Worker 生成的设备密钥对 | refreshToken | JWT Token          |
+| 添加账号     | 抖音扫码 + 粘贴回调链接      | 微信扫码         | 弹窗登录 + 粘贴授权地址       |
+| 凭据       | refreshToken + Worker 生成的设备密钥对 | refreshToken | OAuth 换取的 JWT      |
 | 执行内容     | 每日积分领取             | 每日签到         | 套餐活动领取             |
 | 列表额外信息   | 余额、本次到账            | 连签天数、本期累计    | 累计额度、本次到账          |
 
@@ -91,24 +91,36 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 > **为什么整页打开而不是嵌在控制台里**：官方登录页响应头带了 `frame-ancestors 'self'`，禁止被第三方页面内嵌，硬塞进 iframe 只会是一片空白。所以改成在新窗口打开。
 
-### ZCode：粘贴 JWT
+### ZCode：弹窗登录 + 粘贴地址
 
-ZCode 的客户端凭据是一串 JWT，没有可被第三方复用的扫码授权链路，所以添加方式是**抓一次请求头、粘一次 JWT**：
+ZCode 走的是 **Z.ai 账号的 OAuth 授权**（和官方客户端同一条链路），控制台把它拆成「弹窗登录 → 粘贴地址」两步：
 
-1. 登录 ZCode 客户端（`zcode.z.ai`），或浏览器打开 [z.ai](https://z.ai) 并使用同一账号
-2. 按 `F12` 打开开发者工具 → **Network（网络）** 面板，过滤 `zcode.z.ai`
-3. 刷新页面或触发任意套餐 / 计费操作，点任一发往 `zcode.z.ai` 的请求
-4. 在 **Headers → Request Headers** 里找到 `Authorization: Bearer …`，复制 Bearer 后面的整串 JWT
-5. 回到控制台 ZCode 标签页，把 JWT 粘进输入框 → 点「添加账号」
+1. 点 **「登录 ZCode」** → 新窗口打开 Z.ai 授权页
+2. 用你的 Z.ai 账号登录并确认授权
+3. 登录完成后会落到 `zcode.z.ai/app/oauth/login` 的跳板页，浏览器可能弹出「打开 ZCode」——**点取消**，直接复制该页地址栏的整段链接（带 `code` 和 `state`）
+4. 回到控制台，把整段链接粘进「登录后的整段地址」→ 点 **「解析并添加」**
 
-也可以顺带填两项可选信息（不填走默认值）：
+Worker 会从链接里取出 `code` / `state`，用发起登录时保存的 `redirect_uri` 去 ZCode 换取 JWT，再加密入库。`state` 只保留 15 分钟，过期重新点一次登录即可。
+
+**为什么还要粘贴一下**：这里沿用官方客户端的回调地址（`zcode.z.ai/app/oauth/login`，最终指向 `zcode://oauth/callback`），保证授权链路和官方一致；跳板页又不允许被第三方页面内嵌。所以最后一步只能由浏览器里的人复制一次地址——和 Trae 粘贴回调链接是同一个思路，只是 ZCode 的授权码直接出现在地址栏里，不需要抓请求头。
+
+> 跳板页若弹出「打开 ZCode」，点**取消**。让客户端接管会把授权码消费掉，控制台就换不到令牌了。
+
+**备用方式：手动粘贴 JWT**。授权页改版或登录受阻时，展开「登录走不通？手动粘贴 JWT」：
+
+1. 登录 ZCode 客户端，或浏览器打开 [z.ai](https://z.ai)
+2. 按 `F12` → **Network（网络）** → 过滤 `zcode.z.ai`
+3. 点任一请求，在 **Headers → Request Headers** 里复制 `Authorization: Bearer` 后面的整串
+4. 粘进输入框 → 点「保存 JWT」
+
+两项可选信息（不填走默认值）：
 
 | 字段    | 说明                              |
 | ----- | ------------------------------- |
 | 设备 MID | 同一请求头里的 `X-Device-Mid`，部分接口可能校验   |
 | 应用版本  | 默认 `1.0.0`，对应请求头 `X-ZCode-App-Version` |
 
-Worker 会先用预览接口验一次令牌，把 JWT 加密存进 KV，然后按活动状态自动领取。**ZCode 没有 refreshToken**：JWT 过期后列表会显示「令牌失效」，重新抓一串粘贴即可（删号重加，或直接添加新账号）。
+**ZCode 没有 refreshToken**：JWT 过期后列表会显示「令牌失效」，重新点一次「登录 ZCode」就能换新，不用再抓请求头。
 
 账号的**备注名优先取自账号昵称**，取不到时是 `Trae-xxxx` / `账号-xxxx` / `ZCode-xxxx`，点备注旁的铅笔随时能改，不用手动填表单。每个平台都能放多个账号，互不影响。
 
@@ -164,7 +176,7 @@ ZCode 是**活动领取制**而不是每日签到，状态按最近一次执行�
 | 活动已结束 | 服务端返回 `code=1002`     |
 | 不符合条件 | 服务端返回 `code=1004`     |
 | 领取失败  | 请求异常或未知返回码，下方显示原因     |
-| 令牌失效  | JWT 过期或被服务端拒绝，重新粘贴即可   |
+| 令牌失效  | JWT 过期或被服务端拒绝，重新点「登录 ZCode」即可 |
 
 > 所有「今日」状态都由**当天**现算（按北京时间），不存在「昨天领过、今天还显示已领取」的情况。
 
@@ -295,7 +307,9 @@ jobs:
 | POST | `/wb/api/remove`              | 删除 WorkBuddy 账号，body `{"id":"..."}`                  |
 | POST | `/wb/api/rename`              | 改 WorkBuddy 备注，body `{"id":"...","label":"..."}`     |
 | GET  | `/zc/api/list`                | ZCode 账号列表                                           |
-| POST | `/zc/api/add`                 | 添加 ZCode 账号，body `{"jwt":"...","deviceMid":"...","appVersion":"..."}` |
+| POST | `/zc/api/login/start`         | 生成 Z.ai 授权地址，无需 body                              |
+| POST | `/zc/api/login/claim`         | 用登录后的整段地址换 JWT 并添加账号，body `{"url":"..."}`          |
+| POST | `/zc/api/add`                 | 备用：手动粘贴 JWT，body `{"jwt":"...","deviceMid":"...","appVersion":"..."}` |
 | POST | `/zc/api/run`                 | ZCode 领取，加 `?force=1` 强制                              |
 | POST | `/zc/api/remove`              | 删除 ZCode 账号，body `{"id":"..."}`                       |
 | POST | `/zc/api/rename`              | 改 ZCode 备注，body `{"id":"...","label":"..."}`           |
@@ -324,9 +338,13 @@ jobs:
 | Trae 显示「令牌失效」                    | 很久没跑，或账号在别处登出过                   | 重新扫码                                     |
 | WorkBuddy 登录窗口是空白页               | 浏览器把 `about:blank` 当广告拦了，或代理没加载完 | 重新点一次；仍空白就在状态里点链接直接打开                    |
 | 提示「登录会话已过期」                      | 二维码超过有效期没扫                       | 重新扫码                                     |
-| ZCode 添加时报「这不像 JWT」              | 只复制了片段，或粘成了别的内容                  | 复制 `Authorization` 里 Bearer 后面完整的三段 JWT |
-| ZCode 添加时报「令牌无效或已失效」             | JWT 已过期，或账号在别处登出                  | 回客户端重新抓一串新的 JWT                          |
-| ZCode 显示「令牌失效」                   | JWT 到期（ZCode 没有 refreshToken）  | 重新抓 JWT 后删号重加，或直接添加新账号                   |
+| ZCode 登录后停在「打开 ZCode」提示           | 正常，这是官方跳板页                       | 点取消，再复制该页地址栏的整段链接，回控制台粘贴                 |
+| ZCode 提示「登录会话不存在或已过期」           | 授权超过 15 分钟，或粘贴的不是本次登录的地址        | 重新点「登录 ZCode」，在 15 分钟内完成粘贴                |
+| ZCode 提示「链接里没有 code / state」       | 复制成了登录页或跳板页之外的地址                 | 复制授权完成后跳板页的地址栏全段                         |
+| ZCode 提示「授权失败」                    | 授权码已被使用、过期，或 redirect_uri 对不上     | 重新点「登录 ZCode」再走一遍                        |
+| ZCode 手动添加报「这不像 JWT」             | 只复制了片段，或粘成了别的内容                  | 复制 `Authorization` 里 Bearer 后面完整的三段 JWT |
+| ZCode 手动添加报「令牌无效或已失效」          | JWT 已过期，或账号在别处登出                  | 重新登录，或重新抓一串新的 JWT                        |
+| ZCode 显示「令牌失效」                   | JWT 到期（ZCode 没有 refreshToken）  | 重新点「登录 ZCode」换新                          |
 | ZCode 显示「暂无可领」                    | 预览接口显示暂无活动套餐                     | 正常状态，等下一轮 cron 或活动上线                     |
 | ZCode 显示「名额已领完」                   | 服务端返回 `code=1005`                | 等后续名额或新活动                                |
 | 一直没动静                            | cron 没配 / 时区搞错                   | 检查 Triggers 里那条 cron，注意填的是 UTC           |
@@ -354,7 +372,7 @@ jobs:
 1. **三个平台的接口都是逆向得到的**，客户端升级可能改路径、请求头或参数，届时需要跟进适配
 2. **只做签到 / 领取**，没做成长中心那套（连登奖励、兑换、任务等）——那些接口参数更复杂、变动更频繁
 3. **Trae 的授权码只能落到 127.0.0.1**，所以加账号的最后一步要手动粘贴一次回调链接；一个账号只需做一次，之后靠 refreshToken 自动续期
-4. **ZCode 的 JWT 不能自动续期**：ZCode 未提供 refreshToken，过期后需要重新粘贴
+4. **ZCode 的 JWT 不能自动续期**：ZCode 未提供 refreshToken，过期后需要重新登录一次换取新 JWT
 5. 免费额度绰绰有余：Workers 10 万请求/天，KV 10 万读 / 1000 写 / 天——一天跑一两次，连零头都用不到
 
 ---

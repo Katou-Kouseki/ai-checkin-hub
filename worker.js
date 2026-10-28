@@ -2045,6 +2045,11 @@ const ZCode = (() => {
 const API = 'https://zcode.z.ai';
 const PREVIEW_PATH = '/api/v1/zcode-plan/billing/preview';
 const CLAIM_PATH = '/api/v1/zcode-plan/billing/claim';
+const OAUTH_AUTHORIZE = 'https://chat.z.ai/api/oauth/authorize';
+const OAUTH_TOKEN = 'https://zcode.z.ai/api/v1/oauth/token';
+const OAUTH_CLIENT_ID = 'client_P8X5CMWmlaRO9gyO-KSqtg';
+const CALLBACK_DEEP_LINK = 'zcode://oauth/callback';
+const OAUTH_STATE_TTL = 900;
 const DEFAULT_VERSION = '1.0.0';
 const COOLDOWN_MS = 5 * 60e3;
 
@@ -2214,6 +2219,19 @@ function labelFromJwt(tok) {
     p.email || p.user_name || p.preferred_username || '';
   return String(v).trim().slice(0, 40);
 }
+
+/* ------------------------------------------------------------------ */
+/* 登录：沿用 ZCode 客户端的 Z.ai OAuth 流程                            */
+/* ------------------------------------------------------------------ */
+
+/** 官方网页跳板：登录后落在 zcode.z.ai，地址栏里带着 code / state */
+function bridgeRedirect(appVersion) {
+  return 'https://zcode.z.ai/app/oauth/login?redirect=' +
+    encodeURIComponent(CALLBACK_DEEP_LINK) +
+    '&app_version=' + encodeURIComponent(appVersion || DEFAULT_VERSION);
+}
+
+const stateKey = (state) => `oauth:${state}`;
 
 /* ------------------------------------------------------------------ */
 /* 与 ZCode 服务端交互                                                 */
@@ -2458,10 +2476,159 @@ async function readBody(request) {
 /* 路由                                                                */
 /* ------------------------------------------------------------------ */
 
+/** 新建账号记录：加密落盘并写入索引 */
+async function createAccount(env, { jwt, deviceMid = '', appVersion = DEFAULT_VERSION, label = '', note = '', source = 'jwt' }) {
+  const id = randomId(9);
+  const acct = {
+    id,
+    label: (label || labelFromJwt(jwt) || `ZCode-${id.slice(0, 4)}`).slice(0, 40),
+    jwt,
+    deviceMid,
+    appVersion: appVersion || DEFAULT_VERSION,
+    source,
+    createdAt: Date.now(),
+    lastState: 'new',
+    lastMsg: note || '尚未运行',
+    totalUnits: 0,
+    totalClaims: 0,
+  };
+  await putAccount(env, acct);
+
+  const list = await listAccounts(env);
+  list.push({ id, label: acct.label, createdAt: acct.createdAt });
+  await saveIndex(env, list);
+  return acct;
+}
+
+/** 第一步：生成授权地址，state 只留 15 分钟 */
+async function handleLoginStart(request, env) {
+  // app_version 固定用 1.0.0：跳板页从 3.9.1 起会额外调用 CLI 回调接口，
+  // 那一步会把授权码消费掉，我们就换不到 token 了。低版本只展示页面和深链。
+  const appVersion = DEFAULT_VERSION;
+  const state = randomId(18);
+  const redirectUri = bridgeRedirect(appVersion);
+
+  await env.ZC_KV.put(stateKey(state), JSON.stringify({ redirectUri, appVersion, at: Date.now() }), {
+    expirationTtl: OAUTH_STATE_TTL,
+  });
+
+  const qs = new URLSearchParams({
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    client_id: OAUTH_CLIENT_ID,
+    state,
+  });
+  return json({ url: `${OAUTH_AUTHORIZE}?${qs}`, state, redirectUri });
+}
+
+/** 从回调地址里取参数：优先 searchParams，兼容服务端拼接不规范时的原始串 */
+function callbackParam(raw, u, names) {
+  for (const n of names) {
+    const v = u.searchParams.get(n);
+    if (v) return v.trim();
+  }
+  for (const n of names) {
+    const m = raw.match(new RegExp('[?&]' + n + '=([^&#\\s]+)'));
+    if (m) {
+      try {
+        return decodeURIComponent(m[1]).trim();
+      } catch {
+        return m[1].trim();
+      }
+    }
+  }
+  return '';
+}
+
+/** 第二步：解析粘贴回来的授权地址，换 JWT 并入库 */
+async function handleLoginClaim(request, env) {
+  const body = await readBody(request);
+  const rawUrl = String(body.url ?? body.callbackUrl ?? '').trim();
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return json({ error: '请粘贴登录完成后浏览器地址栏的完整链接' }, 400);
+  }
+
+  const code = callbackParam(rawUrl, u, ['code', 'authCode']);
+  const state = callbackParam(rawUrl, u, ['state']);
+  if (!code || !state) {
+    return json({ error: '链接里没有 code / state，请确认复制的是授权完成后的整段地址' }, 400);
+  }
+
+  const savedRaw = await env.ZC_KV.get(stateKey(state));
+  if (!savedRaw) return json({ error: '登录会话不存在或已过期（15 分钟），请重新点「登录 ZCode」' }, 400);
+  let saved = null;
+  try {
+    saved = JSON.parse(savedRaw);
+  } catch {
+    /* 记录损坏按过期处理 */
+  }
+  if (!saved || Date.now() - num(saved.at) > OAUTH_STATE_TTL * 1000) {
+    await env.ZC_KV.delete(stateKey(state));
+    return json({ error: '登录会话已过期（15 分钟），请重新点「登录 ZCode」' }, 400);
+  }
+
+  // 换 token 时必须用发起登录时那个 redirect_uri，不一致会被服务端拒绝
+  const redirectUri = String(saved.redirectUri || bridgeRedirect(saved.appVersion));
+  const headers = zcHeaders('', { appVersion: saved.appVersion });
+  delete headers.Authorization;
+  headers['Content-Type'] = 'application/json';
+
+  let res, text;
+  try {
+    res = await fetch(OAUTH_TOKEN, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ provider: 'zai', code, redirect_uri: redirectUri, state }),
+    });
+    text = await res.text();
+  } catch (e) {
+    return json({ error: '连接 ZCode 授权服务失败：' + e.message }, 502);
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    /* 下面按 HTTP 状态处理 */
+  }
+  if (!payload) {
+    return json({ error: `授权服务返回异常（HTTP ${res.status}）${String(text || '').slice(0, 120)}` }, 502);
+  }
+  if (res.status !== 200 || payload.code !== 0) {
+    return json({ error: payload.msg || payload.message || `授权失败（HTTP ${res.status} / code=${payload.code}）` }, 400);
+  }
+
+  const data = payload.data || {};
+  const jwt = String(data.token || '').trim();
+  if (jwt.split('.').length !== 3) {
+    return json({ error: '授权成功但没有拿到有效 JWT，请改用手动粘贴 JWT' }, 502);
+  }
+  if (jwtExp(jwt) && jwtExp(jwt) * 1000 <= Date.now()) {
+    return json({ error: '授权返回的 JWT 已过期，请重新登录' }, 502);
+  }
+
+  const user = data.user || {};
+  const label =
+    [user.name, user.nickname, user.email].find((v) => typeof v === 'string' && v.trim()) ||
+    labelFromJwt(jwt);
+
+  const acct = await createAccount(env, {
+    jwt,
+    appVersion: saved.appVersion,
+    label,
+    source: 'oauth',
+    note: '已通过 Z.ai 登录授权，等待领取',
+  });
+  await env.ZC_KV.delete(stateKey(state));
+  return json({ ok: true, id: acct.id, label: acct.label });
+}
+
 /**
- * 添加账号：粘贴 JWT 即可。
- * ZCode 没有可供第三方复用的扫码授权链路，JWT 是客户端自己带在请求头里的凭据；
- * 拿到后由 Worker 加密托管，之后按活动自动领取。
+ * 备用添加方式：手动粘贴 JWT。
+ * 授权页改版或登录受阻时，仍可直接从客户端请求头里复制凭据。
  */
 async function handleAdd(request, env) {
   const body = await readBody(request);
@@ -2492,25 +2659,8 @@ async function handleAdd(request, env) {
     return json({ error: '无法连接 ZCode 服务端：' + e.message }, 502);
   }
 
-  const id = randomId(9);
-  const acct = {
-    id,
-    label: labelFromJwt(jwt) || `ZCode-${id.slice(0, 4)}`,
-    jwt,
-    deviceMid,
-    appVersion,
-    createdAt: Date.now(),
-    lastState: 'new',
-    lastMsg: probeMsg || '尚未运行',
-    totalUnits: 0,
-    totalClaims: 0,
-  };
-  await putAccount(env, acct);
-
-  const list = await listAccounts(env);
-  list.push({ id, label: acct.label, createdAt: acct.createdAt });
-  await saveIndex(env, list);
-  return json({ ok: true, id, label: acct.label, note: probeMsg || undefined });
+  const acct = await createAccount(env, { jwt, deviceMid, appVersion, note: probeMsg || '尚未运行' });
+  return json({ ok: true, id: acct.id, label: acct.label, note: probeMsg || undefined });
 }
 
 async function handleList(request, env) {
@@ -2619,6 +2769,8 @@ const __mod = {
       if (!a.ok) return a.res;
 
       if (path === '/api/list' && method === 'GET') return handleList(request, env);
+      if (path === '/api/login/start' && method === 'POST') return handleLoginStart(request, env);
+      if (path === '/api/login/claim' && method === 'POST') return handleLoginClaim(request, env);
       if (path === '/api/add' && method === 'POST') return handleAdd(request, env);
       if (path === '/api/remove' && method === 'POST') return handleRemove(request, env);
       if (path === '/api/rename' && method === 'POST') return handleRename(request, env);
@@ -2886,6 +3038,10 @@ const PAGE = `<!DOCTYPE html>
            width:100%;transition:border-color .18s,box-shadow .18s}
   textarea::placeholder{color:var(--dim)}
   textarea:focus{border-color:var(--pri);box-shadow:0 0 0 4px var(--ring)}
+  details.adv{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+  details.adv summary{cursor:pointer;color:var(--dim);font-size:13px;user-select:none}
+  details.adv summary:hover{color:var(--txt)}
+  details.adv[open] summary{margin-bottom:12px}
   button{font:inherit;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:8px;
          padding:11px 18px;border-radius:12px;border:1px solid var(--line-2);background:var(--surface);color:var(--txt);
          cursor:pointer;transition:transform .12s ease,box-shadow .18s ease,border-color .18s ease,filter .18s ease}
@@ -3118,18 +3274,28 @@ const PAGE = `<!DOCTYPE html>
         <div class="col">
           <div class="card">
             <div class="card-head"><h2>添加账号 · ZCode</h2></div>
-            <label class="lbl" for="zcJwt">JWT Token</label>
-            <textarea id="zcJwt" placeholder="粘贴 ZCode 客户端请求头里的 JWT：Authorization: Bearer 后面的整串"></textarea>
+            <button class="pri" id="zcLogin" style="width:100%">登录 ZCode</button>
+            <div class="hint" id="zcLoginStatus">点上面的按钮会弹出 Z.ai 登录页；登录成功后把地址栏的整段链接粘贴到下面。若提示「打开 ZCode」，点取消。</div>
+            <label class="lbl" for="zcCallback" style="margin-top:12px">登录后的整段地址</label>
+            <textarea id="zcCallback" rows="3" placeholder="https://zcode.z.ai/app/oauth/login?redirect=...&code=...&state=..."></textarea>
             <div class="row" style="margin-top:10px">
-              <input id="zcMid" placeholder="设备 MID（可选）">
-              <input id="zcVer" placeholder="应用版本（可选，默认 1.0.0）">
+              <button class="pri" id="zcClaim">解析并添加</button>
             </div>
-            <div class="row" style="margin-top:10px">
-              <button class="pri" id="zcAdd">添加账号</button>
-            </div>
-            <div class="hint" id="zcAddStatus">登录 ZCode 客户端 → F12 → Network（网络）→ 过滤 <code>zcode.z.ai</code> → 点任一请求 → 复制 <code>Authorization</code> 里 Bearer 后面的整串 JWT。凭据加密保存，之后按活动自动领取。</div>
-            <div class="err" id="zcAddErr"></div>
-            <div class="hint">ZCode 是「有活动就领」的领取制，不是每日签到：Worker 每轮先看预览，没有可领套餐就不发领取请求。</div>
+            <div class="err" id="zcClaimErr"></div>
+            <details class="adv">
+              <summary>登录走不通？手动粘贴 JWT</summary>
+              <textarea id="zcJwt" placeholder="粘贴 Authorization: Bearer 后面的整串 JWT"></textarea>
+              <div class="row" style="margin-top:10px">
+                <input id="zcMid" placeholder="设备 MID（可选）">
+                <input id="zcVer" placeholder="应用版本（可选，默认 1.0.0）">
+              </div>
+              <div class="row" style="margin-top:10px">
+                <button id="zcAdd">保存 JWT</button>
+              </div>
+              <div class="hint" id="zcAddStatus">F12 → Network（网络）→ 过滤 <code>zcode.z.ai</code> → 复制 <code>Authorization</code> 里 Bearer 后面的整串。</div>
+              <div class="err" id="zcAddErr"></div>
+            </details>
+            <div class="hint">登录凭据加密保存；ZCode 是「有活动就领」的领取制，不是每日签到：Worker 每轮先看预览，没有可领套餐就不发领取请求。</div>
           </div>
         </div>
       </div>
@@ -3622,7 +3788,48 @@ $('#wbQr').onclick = function(){
     });
 };
 
-/* ---------------- ZCode 添加账号 ---------------- */
+/* ---------------- ZCode 登录 / 解析授权地址 ---------------- */
+
+$('#zcLogin').onclick = function(){
+  var btn = $('#zcLogin');
+  if(btn.disabled) return;
+  $('#zcClaimErr').textContent = '';
+  // 先同步开窗，避免异步请求回来后被浏览器当成弹窗拦截
+  var win = window.open('about:blank', 'zc-login', 'width=560,height=760');
+  btn.disabled = true; btn.textContent = '打开授权页…';
+  api('/zc/api/login/start', { method:'POST', body:'{}' })
+    .then(function(d){
+      if(win){
+        win.location.href = d.url;
+        $('#zcLoginStatus').textContent = '授权页已打开。登录成功后若提示「打开 ZCode」请点取消，再把新窗口地址栏的整段链接复制到下面。';
+      }else{
+        $('#zcLoginStatus').innerHTML = '弹窗被拦截，<a href="' + esc(d.url) + '" target="_blank" rel="noopener">点此打开授权页</a>，登录后把整段地址复制到下面。';
+      }
+    })
+    .catch(function(e){
+      if(win) win.close();
+      $('#zcClaimErr').textContent = String(e.message || e);
+    })
+    .then(function(){ btn.disabled = false; btn.textContent = '登录 ZCode'; });
+};
+
+$('#zcClaim').onclick = function(){
+  var btn = $('#zcClaim');
+  var url = $('#zcCallback').value.trim();
+  if(!url || btn.disabled) return;
+  $('#zcClaimErr').textContent = '';
+  btn.disabled = true; btn.textContent = '解析中…';
+  api('/zc/api/login/claim', { method:'POST', body: JSON.stringify({ url: url }) })
+    .then(function(d){
+      $('#zcLoginStatus').textContent = '已添加「' + d.label + '」，之后按活动自动领取。';
+      $('#zcCallback').value = '';
+      return load('zc');
+    })
+    .catch(function(e){ $('#zcClaimErr').textContent = String(e.message || e); })
+    .then(function(){ btn.disabled = false; btn.textContent = '解析并添加'; });
+};
+
+/* ---------------- ZCode 手动粘贴 JWT ---------------- */
 
 $('#zcAdd').onclick = function(){
   var btn = $('#zcAdd');
@@ -3641,7 +3848,7 @@ $('#zcAdd').onclick = function(){
       return load('zc');
     })
     .catch(function(e){ $('#zcAddErr').textContent = String(e.message || e); })
-    .then(function(){ btn.disabled = false; btn.textContent = '添加账号'; });
+    .then(function(){ btn.disabled = false; btn.textContent = '保存 JWT'; });
 };
 
 /* ---------------- 事件绑定 ---------------- */
