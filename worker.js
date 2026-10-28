@@ -2311,28 +2311,56 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** 把预览里的套餐整理成领取所需的最小结构；官方领取接口必须带 plan_id */
+function claimPlans(json) {
+  return pickPlans(json)
+    .filter(isClaimable)
+    .map((p) => {
+      const list = Array.isArray(p.entitlements) ? p.entitlements : [];
+      const units = list.reduce((sum, e) => sum + num(e?.grant_units ?? e?.grantUnits), 0);
+      return {
+        planId: String(p.plan_id ?? p.planId ?? '').trim(),
+        name: String(p.name ?? p.title ?? '').trim(),
+        units,
+      };
+    })
+    .filter((p) => p.planId);
+}
+
+/** 领取响应的 code 在部分版本里是字符串，统一成数字 */
+function normalizeCode(v) {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v);
+  return v;
+}
+
 /** 解析领取响应：code 语义与 ZCode 客户端一致 */
-function parseClaim(status, json, text) {
+function parseClaim(status, json, text, fallback = {}) {
   if (status === 401 || status === 403) {
     return { state: 'token_dead', msg: `令牌失效或过期（HTTP ${status}），请重新获取 JWT` };
   }
   if (!json || typeof json !== 'object') {
     return { state: 'error', msg: `领取失败：响应不是 JSON（HTTP ${status}）${String(text || '').slice(0, 120)}` };
   }
-  const code = json.code;
-  const msg = json.message || json.msg || '';
+  const code = normalizeCode(json.code);
   const data = json.data || {};
+  const msg = json.message || json.msg || data.message || data.msg || '';
   const plan = data.plan || data.plan_info || data.current_plan || {};
 
   if (code === 0) {
-    const units = num(plan.units) || num(data.units) || num(data.credit);
-    const planName = String(plan.name || plan.title || data.plan_name || '').trim().slice(0, 40);
+    const ents = Array.isArray(plan.entitlements) ? plan.entitlements : [];
+    const granted = ents.reduce((sum, e) => sum + num(e?.grant_units ?? e?.grantUnits), 0);
+    const units = granted || num(plan.units) || num(data.units) || num(data.credit) || num(fallback.units);
+    const planName = String(plan.name || plan.title || data.plan_name || fallback.name || '').trim().slice(0, 40);
     return { state: 'checked', units, planName, msg: msg || '领取成功' };
   }
   if (code === 1003) return { state: 'already', msg: '该套餐已领取过' };
   if (code === 1005) return { state: 'exhausted', msg: '名额已领完' };
   if (code === 1002) return { state: 'ended', msg: '该活动已结束' };
   if (code === 1004) return { state: 'ineligible', msg: '不符合领取条件' };
+  if (/安全验证|security verification|captcha/i.test(msg)) {
+    return { state: 'error', msg: '服务端要求人机验证，请先在 ZCode 客户端手动领取一次，或稍后再试' };
+  }
   return { state: 'error', msg: msg || `领取失败(code=${code})` };
 }
 
@@ -2358,12 +2386,12 @@ async function claimOne(env, acct, { force = false } = {}) {
     return { id: acct.id, label: acct.label, state: 'skipped', msg: '刚领取过，稍后自动重试' };
   }
 
-  // 先看预览：能明确判断「没有可领套餐」时就不发领取请求
+  // 先看预览：官方领取接口必须带 plan_id，这里顺便取到套餐名与额度
   let pre = null;
   try {
     pre = await zcFetch(previewUrl(acct.appVersion), { method: 'GET', jwt: acct.jwt, acct });
   } catch {
-    /* 预览失败不阻塞领取 */
+    /* 下面统一处理 */
   }
   if (pre && (pre.status === 401 || pre.status === 403)) {
     acct.lastState = 'token_dead';
@@ -2373,34 +2401,45 @@ async function claimOne(env, acct, { force = false } = {}) {
     return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg };
   }
 
-  let hasClaimable = null;
+  let plans = [];
   if (pre && pre.status === 200 && pre.json) {
-    const plans = pickPlans(pre.json);
-    if (plans.length) hasClaimable = plans.some(isClaimable);
-    const d = pre.json.data ?? pre.json;
-    if (hasClaimable === null && typeof d?.has_claimable === 'boolean') hasClaimable = d.has_claimable;
+    plans = claimPlans(pre.json);
   }
 
-  if (hasClaimable === false) {
-    acct.lastState = 'none';
-    acct.lastMsg = '暂无可领套餐，等待下一次活动';
+  if (!plans.length) {
+    const noPlan = pre && pre.status === 200;
+    acct.lastState = noPlan ? 'none' : 'error';
+    acct.lastMsg = noPlan
+      ? '暂无可领套餐，等待下一次活动'
+      : `预览失败（HTTP ${pre?.status ?? 'network'}），无法获取可领套餐`;
     acct.lastRun = now;
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: 'skipped', msg: acct.lastMsg };
+    return {
+      id: acct.id,
+      label: acct.label,
+      state: noPlan ? 'skipped' : 'error',
+      msg: acct.lastMsg,
+    };
   }
 
-  let res;
-  try {
-    res = await zcFetch(CLAIM_PATH, { jwt: acct.jwt, acct, body: '{}' });
-  } catch (e) {
-    acct.lastState = 'error';
-    acct.lastMsg = `领取请求异常: ${e.message}`;
-    acct.lastRun = now;
-    await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: 'error', msg: acct.lastMsg };
+  // 逐个尝试：已领过 / 领完的套餐换下一个；成功或硬失败即停
+  let r = null;
+  for (const plan of plans) {
+    let res;
+    try {
+      res = await zcFetch(CLAIM_PATH, {
+        jwt: acct.jwt,
+        acct,
+        body: JSON.stringify({ plan_id: plan.planId }),
+      });
+    } catch (e) {
+      r = { state: 'error', msg: `领取请求异常: ${e.message}` };
+      break;
+    }
+    r = parseClaim(res.status, res.json, res.text, plan);
+    if (r.state === 'checked' || r.state === 'error' || r.state === 'token_dead') break;
   }
 
-  const r = parseClaim(res.status, res.json, res.text);
   acct.lastRun = now;
 
   if (r.state === 'checked') {
